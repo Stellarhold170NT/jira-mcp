@@ -1,0 +1,619 @@
+package jiramcp
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/mmatczuk/jira-mcp/internal/jira"
+	"github.com/mmatczuk/jira-mcp/internal/mdconv"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+type ReadArgs struct {
+	Keys []string `json:"keys,omitempty" jsonschema:"Issue keys to fetch (e.g. PROJ-1). Mutually exclusive with jql and resource."`
+
+	JQL string `json:"jql,omitempty" jsonschema:"JQL search query. Mutually exclusive with keys and resource."`
+
+	Resource string `json:"resource,omitempty" jsonschema:"Resource to list: projects, boards, sprints, sprint_issues, remote_links, worklogs. Mutually exclusive with keys and jql."`
+
+	BoardID  int    `json:"board_id,omitempty" jsonschema:"Board ID. Required for resource=sprints."`
+	SprintID int    `json:"sprint_id,omitempty" jsonschema:"Sprint ID. Required for resource=sprint_issues."`
+	IssueKey string `json:"issue_key,omitempty" jsonschema:"Issue key. Required for resource=remote_links or worklogs."`
+
+	ProjectKey  string `json:"project_key,omitempty" jsonschema:"Filter boards by project key."`
+	BoardName   string `json:"board_name,omitempty" jsonschema:"Filter boards by name substring."`
+	BoardType   string `json:"board_type,omitempty" jsonschema:"Filter boards by type: scrum, kanban."`
+	SprintState string `json:"sprint_state,omitempty" jsonschema:"Filter sprints by state: active, closed, future."`
+
+	Fields        string `json:"fields,omitempty" jsonschema:"Comma-separated field names to return (default: all)."`
+	Expand        string `json:"expand,omitempty" jsonschema:"Comma-separated expansions (e.g. renderedFields transitions changelog; changelog lists changed field names without values)."`
+	Limit         int    `json:"limit,omitempty" jsonschema:"Max results to return. Default 100."`
+	StartAt       int    `json:"start_at,omitempty" jsonschema:"Pagination offset for resource listings (boards, sprints). Not used for JQL search."`
+	NextPageToken string `json:"next_page_token,omitempty" jsonschema:"Token for fetching the next page of JQL search results. Returned in previous search response."`
+
+	FieldFormat string `json:"field_format,omitempty" jsonschema:"How to render ADF rich-text custom fields in the response. raw (default): ADF objects passed through. markdown: ADF rich-text fields (schema_custom ending in :textarea) are converted to Markdown server-side. Allowed: raw, markdown."`
+}
+
+var readTool = &mcp.Tool{
+	Name: "jira_read",
+	Description: `Fetch JIRA data. Three modes (provide exactly one):
+
+1. keys — Fetch issues by key. Pass one or more issue keys like ["PROJ-1", "PROJ-2"].
+2. jql — Search issues with JQL query. Supports all JIRA JQL syntax.
+3. resource — List a resource type: "projects", "boards", "sprints" (needs board_id), "sprint_issues" (needs sprint_id), "remote_links" (needs issue_key — web links from an issue to external resources, not internal issue-to-issue links), "worklogs" (needs issue_key — work-log entries on the issue).
+
+Common options: fields (comma-separated), expand, limit (default 100), start_at, field_format.
+field_format=markdown converts ADF rich-text custom fields (jira_schema reports content_format="adf") to Markdown server-side. Default raw passes ADF through unchanged.
+Hint: Use jira_schema resource=transitions with an issue_key to find valid transition IDs before transitioning.
+
+Descriptions and comments for older issues are returned in Jira wiki-markup, not Markdown. Do not feed a description/comment string from jira_read straight back into jira_write — the default write path expects Markdown and will reject recognised wiki-markup tokens. Either convert to Markdown, or set description_format="wiki" / comment_format="wiki" on the write to preserve wiki-markup input.`,
+}
+
+func (h *handlers) handleRead(ctx context.Context, _ *mcp.CallToolRequest, args ReadArgs) (*mcp.CallToolResult, any, error) {
+	if args.Limit == 0 {
+		args.Limit = 100
+	}
+
+	switch args.FieldFormat {
+	case "", "raw", "markdown":
+	default:
+		return textResult(fmt.Sprintf("Invalid field_format %q. Allowed: raw, markdown.", args.FieldFormat), true), nil, nil
+	}
+
+	modes := 0
+	if len(args.Keys) > 0 {
+		modes++
+	}
+	if args.JQL != "" {
+		modes++
+	}
+	if args.Resource != "" {
+		modes++
+	}
+
+	if modes == 0 {
+		return textResult("Provide exactly one of: keys, jql, or resource. Example: {\"keys\": [\"PROJ-1\"]} or {\"jql\": \"project = PROJ\"} or {\"resource\": \"projects\"}", true), nil, nil
+	}
+	if modes > 1 {
+		return textResult("Provide exactly one of: keys, jql, or resource — not multiple.", true), nil, nil
+	}
+
+	switch {
+	case len(args.Keys) > 0:
+		return h.readByKeys(ctx, args), nil, nil
+	case args.JQL != "":
+		return h.readByJQL(ctx, args), nil, nil
+	default:
+		return h.readResource(ctx, args), nil, nil
+	}
+}
+
+// customfieldRenderer transforms a custom-field value before it lands in the
+// response. nil means "pass through unchanged" — the raw default.
+type customfieldRenderer func(fieldID string, value any) any
+
+// newCustomfieldRenderer returns the renderer for the requested FieldFormat.
+// nil for raw mode means zero schema lookups during the read. The markdown
+// renderer converts ADF rich-text custom fields via FromADF; everything
+// else (unknown fields, non-textarea fields, non-doc values) passes through
+// rather than blocking the read. A GetFields failure also degrades to
+// passthrough so the read still returns the raw ADF.
+func newCustomfieldRenderer(ctx context.Context, client JiraClient, args ReadArgs) customfieldRenderer {
+	if args.FieldFormat != "markdown" {
+		return nil
+	}
+	cache, err := newFieldSchemaCache(ctx, client)
+	if err != nil {
+		return nil
+	}
+	return func(fieldID string, value any) any {
+		schema, err := cache.get(fieldID)
+		if err != nil || !isADFRichText(schema) {
+			return value
+		}
+		doc, ok := value.(map[string]any)
+		if !ok {
+			return value
+		}
+		if t, _ := doc["type"].(string); t != "doc" {
+			return value
+		}
+		md, err := mdconv.FromADF(doc)
+		if err != nil {
+			return value
+		}
+		return strings.TrimRight(md, "\n")
+	}
+}
+
+func (h *handlers) readByKeys(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
+	// For a single key use GetIssue (supports Expand, richer fields).
+	// For 2+ keys use a JQL search to reduce API calls.
+	if len(args.Keys) == 1 {
+		opts := &jira.GetQueryOptions{}
+		if args.Fields != "" {
+			opts.Fields = args.Fields
+		}
+		if args.Expand != "" {
+			opts.Expand = args.Expand
+		}
+		issue, changelogTotal, err := h.client.GetIssue(ctx, args.Keys[0], opts)
+		if err != nil {
+			return formatReadResult("Fetched 0 issue(s)", nil, []string{fmt.Sprintf("%s: %v", args.Keys[0], err)})
+		}
+		render := newCustomfieldRenderer(ctx, h.client, args)
+		return formatReadResult("Fetched 1 issue(s)", []map[string]any{issueToMap(issue, changelogTotal, render)}, nil)
+	}
+
+	// Build issueKey in (...) JQL for multi-key fetch.
+	quoted := make([]string, len(args.Keys))
+	for i, k := range args.Keys {
+		quoted[i] = fmt.Sprintf("%q", k)
+	}
+	jql := fmt.Sprintf("issueKey in (%s)", strings.Join(quoted, ", "))
+
+	opts := &jira.SearchOptionsV3{MaxResults: len(args.Keys)}
+	if args.Fields != "" {
+		for f := range strings.SplitSeq(args.Fields, ",") {
+			opts.Fields = append(opts.Fields, strings.TrimSpace(f))
+		}
+	}
+	if args.Expand != "" {
+		opts.Expand = args.Expand
+	}
+
+	sr, err := h.client.SearchIssues(ctx, jql, opts)
+	if err != nil {
+		return textResult(fmt.Sprintf("Failed to fetch issues %v: %v", args.Keys, err), true)
+	}
+
+	render := newCustomfieldRenderer(ctx, h.client, args)
+	var results []map[string]any
+	for i := range sr.Issues {
+		results = append(results, issueToMap(&sr.Issues[i], sr.ChangelogTotals[sr.Issues[i].ID], render))
+	}
+	return formatReadResult(fmt.Sprintf("Fetched %d issue(s)", len(results)), results, nil)
+}
+
+func (h *handlers) readByJQL(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
+	opts := &jira.SearchOptionsV3{
+		MaxResults:    args.Limit,
+		NextPageToken: args.NextPageToken,
+	}
+	if args.Fields != "" {
+		for f := range strings.SplitSeq(args.Fields, ",") {
+			opts.Fields = append(opts.Fields, strings.TrimSpace(f))
+		}
+	}
+	if args.Expand != "" {
+		opts.Expand = args.Expand
+	}
+
+	sr, err := h.client.SearchIssues(ctx, args.JQL, opts)
+	if err != nil {
+		return textResult(fmt.Sprintf("JQL search failed: %v\nHint: Check your JQL syntax. Use jira_schema resource=fields to see available field names.", err), true)
+	}
+
+	render := newCustomfieldRenderer(ctx, h.client, args)
+	var results []map[string]any
+	for i := range sr.Issues {
+		results = append(results, issueToMap(&sr.Issues[i], sr.ChangelogTotals[sr.Issues[i].ID], render))
+	}
+
+	summary := fmt.Sprintf("Found %d issue(s) (total %d). JQL: %s", len(results), sr.Total, args.JQL)
+	if sr.NextPageToken != "" {
+		summary += fmt.Sprintf("\nHint: More results available. Use next_page_token=%q to get the next page.", sr.NextPageToken)
+	}
+
+	return formatReadResult(summary, results, nil)
+}
+
+func (h *handlers) readResource(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
+	switch args.Resource {
+	case "projects":
+		return h.readProjects(ctx)
+	case "boards":
+		return h.readBoards(ctx, args)
+	case "sprints":
+		return h.readSprints(ctx, args)
+	case "sprint_issues":
+		return h.readSprintIssues(ctx, args)
+	case "remote_links":
+		return h.readRemoteLinks(ctx, args)
+	case "worklogs":
+		return h.readWorklogs(ctx, args)
+	default:
+		return textResult(fmt.Sprintf("Unknown resource %q. Valid: projects, boards, sprints, sprint_issues, remote_links, worklogs.", args.Resource), true)
+	}
+}
+
+func (h *handlers) readProjects(ctx context.Context) *mcp.CallToolResult {
+	projects, err := h.client.GetAllProjects(ctx)
+	if err != nil {
+		return textResult(fmt.Sprintf("Failed to list projects: %v", err), true)
+	}
+
+	var results []map[string]any
+	if projects != nil {
+		for _, p := range *projects {
+			results = append(results, map[string]any{
+				"key":  p.Key,
+				"name": p.Name,
+				"id":   p.ID,
+			})
+		}
+	}
+
+	return formatReadResult(fmt.Sprintf("Found %d project(s)", len(results)), results, nil)
+}
+
+func (h *handlers) readBoards(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
+	opts := &jira.BoardListOptions{
+		MaxResults: args.Limit,
+		StartAt:    args.StartAt,
+	}
+	if args.ProjectKey != "" {
+		opts.ProjectKeyOrID = args.ProjectKey
+	}
+	if args.BoardName != "" {
+		opts.Name = args.BoardName
+	}
+	if args.BoardType != "" {
+		opts.BoardType = args.BoardType
+	}
+
+	boards, isLast, err := h.client.GetAllBoards(ctx, opts)
+	if err != nil {
+		return textResult(fmt.Sprintf("Failed to list boards: %v", err), true)
+	}
+
+	var results []map[string]any
+	for _, b := range boards {
+		results = append(results, map[string]any{
+			"id":   b.ID,
+			"name": b.Name,
+			"type": b.Type,
+		})
+	}
+
+	summary := fmt.Sprintf("Found %d board(s)", len(results))
+	if !isLast {
+		summary += fmt.Sprintf("\nHint: More boards available. Use start_at=%d to get the next page.", args.StartAt+args.Limit)
+	}
+
+	return formatReadResult(summary, results, nil)
+}
+
+func (h *handlers) readSprints(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
+	if args.BoardID == 0 {
+		return textResult("board_id is required for resource=sprints. Hint: Use jira_read resource=boards to find board IDs.", true)
+	}
+
+	opts := &jira.GetAllSprintsOptions{
+		MaxResults: args.Limit,
+		StartAt:    args.StartAt,
+	}
+	if args.SprintState != "" {
+		opts.State = args.SprintState
+	}
+
+	sprints, isLast, err := h.client.GetAllSprints(ctx, args.BoardID, opts)
+	if err != nil {
+		return textResult(fmt.Sprintf("Failed to list sprints for board %d: %v", args.BoardID, err), true)
+	}
+
+	var results []map[string]any
+	for _, s := range sprints {
+		results = append(results, map[string]any{
+			"id":    s.ID,
+			"name":  s.Name,
+			"state": s.State,
+		})
+	}
+
+	summary := fmt.Sprintf("Found %d sprint(s) for board %d", len(results), args.BoardID)
+	if !isLast {
+		summary += fmt.Sprintf("\nHint: More sprints available. Use start_at=%d to get the next page.", args.StartAt+args.Limit)
+	}
+
+	return formatReadResult(summary, results, nil)
+}
+
+func (h *handlers) readSprintIssues(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
+	if args.SprintID == 0 {
+		return textResult("sprint_id is required for resource=sprint_issues. Hint: Use jira_read resource=sprints board_id=<id> to find sprint IDs.", true)
+	}
+
+	issues, err := h.client.GetSprintIssues(ctx, args.SprintID)
+	if err != nil {
+		return textResult(fmt.Sprintf("Failed to get issues for sprint %d: %v", args.SprintID, err), true)
+	}
+
+	render := newCustomfieldRenderer(ctx, h.client, args)
+	var results []map[string]any
+	for i := range issues {
+		results = append(results, issueToMap(&issues[i], 0, render))
+	}
+
+	summary := fmt.Sprintf("Found %d issue(s) in sprint %d", len(results), args.SprintID)
+	summary += "\nNote: Sprint issues endpoint returns a single page. For large sprints, use jira_read with jql=\"sprint = <sprint_id>\" for full pagination."
+
+	return formatReadResult(summary, results, nil)
+}
+
+func (h *handlers) readRemoteLinks(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
+	if args.IssueKey == "" {
+		return textResult("issue_key is required for resource=remote_links. Hint: pass the issue key whose remote links you want, e.g. {\"resource\": \"remote_links\", \"issue_key\": \"PROJ-1\"}.", true)
+	}
+
+	links, err := h.client.GetRemoteLinks(ctx, args.IssueKey)
+	if err != nil {
+		return textResult(fmt.Sprintf("Failed to get remote links for %s: %v", args.IssueKey, err), true)
+	}
+
+	var results []map[string]any
+	for _, l := range links {
+		results = append(results, remoteLinkToMap(l))
+	}
+
+	return formatReadResult(fmt.Sprintf("Found %d remote link(s) on %s", len(results), args.IssueKey), results, nil)
+}
+
+func remoteLinkToMap(l jira.RemoteLink) map[string]any {
+	m := map[string]any{
+		"id":  l.ID,
+		"url": l.Object.URL,
+	}
+	if l.Object.Title != "" {
+		m["title"] = l.Object.Title
+	}
+	if l.Object.Summary != "" {
+		m["summary"] = l.Object.Summary
+	}
+	if l.GlobalID != "" {
+		m["globalId"] = l.GlobalID
+	}
+	if l.Relationship != "" {
+		m["relationship"] = l.Relationship
+	}
+	if l.Application != nil && (l.Application.Name != "" || l.Application.Type != "") {
+		app := map[string]any{}
+		if l.Application.Name != "" {
+			app["name"] = l.Application.Name
+		}
+		if l.Application.Type != "" {
+			app["type"] = l.Application.Type
+		}
+		m["application"] = app
+	}
+	if l.Object.Status != nil {
+		m["resolved"] = l.Object.Status.Resolved
+	}
+	return m
+}
+
+func userToMap(u *jira.User) map[string]any {
+	return map[string]any{
+		"displayName": u.DisplayName,
+		"accountId":   u.AccountID,
+	}
+}
+
+func commentToMap(c *jira.Comment) map[string]any {
+	m := map[string]any{
+		"id":      c.ID,
+		"author":  userToMap(&c.Author),
+		"body":    c.Body,
+		"created": c.Created,
+		"updated": c.Updated,
+	}
+	return m
+}
+
+// changelogToMap omits fromString/toString: a description edit carries the
+// full old and new text, which would bloat the response.
+func changelogToMap(c *jira.Changelog, total int) (map[string]any, bool) {
+	if c == nil || len(c.Histories) == 0 {
+		return nil, false
+	}
+	histories := make([]map[string]any, 0, len(c.Histories))
+	for i := range c.Histories {
+		histories = append(histories, changelogHistoryToMap(&c.Histories[i]))
+	}
+	m := map[string]any{"histories": histories}
+	if total > 0 {
+		m["total"] = total
+		m["incomplete"] = total > len(histories)
+	}
+	return m, true
+}
+
+func changelogHistoryToMap(h *jira.ChangelogHistory) map[string]any {
+	items := make([]map[string]any, 0, len(h.Items))
+	for _, item := range h.Items {
+		items = append(items, map[string]any{
+			"field":     item.Field,
+			"fieldtype": item.FieldType,
+		})
+	}
+	return map[string]any{
+		"id":      h.Id,
+		"author":  userToMap(&h.Author),
+		"created": h.Created,
+		"items":   items,
+	}
+}
+
+func attachmentToMap(a *jira.Attachment) map[string]any {
+	m := map[string]any{
+		"id":        a.ID,
+		"filename":  a.Filename,
+		"mime_type": a.MimeType,
+		"size":      a.Size,
+	}
+	if a.Created != "" {
+		m["created"] = a.Created
+	}
+	if a.Author != nil {
+		m["author"] = userToMap(a.Author)
+	}
+	return m
+}
+
+func issueLinkToMap(activeKey string, l *jira.IssueLink) (map[string]any, bool) {
+	if l == nil {
+		return nil, false
+	}
+	var from, to string
+	switch {
+	case l.OutwardIssue != nil:
+		from, to = activeKey, l.OutwardIssue.Key
+	case l.InwardIssue != nil:
+		from, to = l.InwardIssue.Key, activeKey
+	default:
+		return nil, false
+	}
+	return map[string]any{
+		"id":   l.ID,
+		"type": l.Type.Name,
+		"from": from,
+		"to":   to,
+	}, true
+}
+
+// issueToMap builds the output for one issue. changelogTotal is the history
+// count of the embedded changelog, or 0 when the caller does not know it.
+func issueToMap(issue *jira.Issue, changelogTotal int, render customfieldRenderer) map[string]any {
+	m := map[string]any{
+		"key":  issue.Key,
+		"id":   issue.ID,
+		"self": issue.Self,
+	}
+
+	if issue.Fields != nil {
+		fields := map[string]any{
+			"summary": issue.Fields.Summary,
+		}
+		if issue.Fields.Status != nil {
+			fields["status"] = issue.Fields.Status.Name
+		}
+		if issue.Fields.Type.Name != "" {
+			fields["type"] = issue.Fields.Type.Name
+		}
+		if issue.Fields.Assignee != nil {
+			fields["assignee"] = userToMap(issue.Fields.Assignee)
+		}
+		if issue.Fields.Priority != nil {
+			fields["priority"] = issue.Fields.Priority.Name
+		}
+		if issue.Fields.Parent != nil {
+			fields["parent"] = map[string]any{
+				"id":  issue.Fields.Parent.ID,
+				"key": issue.Fields.Parent.Key,
+			}
+		}
+		if issue.Fields.Description != "" {
+			fields["description"] = issue.Fields.Description
+		}
+		if issue.Fields.Labels != nil {
+			fields["labels"] = issue.Fields.Labels
+		}
+		if issue.Fields.Comments != nil {
+			comments := make([]map[string]any, 0, len(issue.Fields.Comments.Comments))
+			for _, c := range issue.Fields.Comments.Comments {
+				if c != nil {
+					comments = append(comments, commentToMap(c))
+				}
+			}
+			if len(comments) > 0 {
+				fields["comment"] = comments
+			}
+		}
+		if len(issue.Fields.Attachments) > 0 {
+			atts := make([]map[string]any, 0, len(issue.Fields.Attachments))
+			for _, a := range issue.Fields.Attachments {
+				if a != nil {
+					atts = append(atts, attachmentToMap(a))
+				}
+			}
+			if len(atts) > 0 {
+				fields["attachments"] = atts
+			}
+		}
+		if len(issue.Fields.IssueLinks) > 0 {
+			links := make([]map[string]any, 0, len(issue.Fields.IssueLinks))
+			for _, l := range issue.Fields.IssueLinks {
+				if link, ok := issueLinkToMap(issue.Key, l); ok {
+					links = append(links, link)
+				}
+			}
+			if len(links) > 0 {
+				fields["issuelinks"] = links
+			}
+		}
+		if !time.Time(issue.Fields.Created).IsZero() {
+			fields["created"] = time.Time(issue.Fields.Created).Format(time.RFC3339)
+		}
+		if !time.Time(issue.Fields.Updated).IsZero() {
+			fields["updated"] = time.Time(issue.Fields.Updated).Format(time.RFC3339)
+		}
+		for k, v := range issue.Fields.Unknowns {
+			if !strings.HasPrefix(k, customFieldPrefix) {
+				continue
+			}
+			if render != nil {
+				v = render(k, v)
+			}
+			fields[k] = v
+		}
+		m["fields"] = fields
+	}
+	if changelog, ok := changelogToMap(issue.Changelog, changelogTotal); ok {
+		m["changelog"] = changelog
+	}
+
+	return m
+}
+
+// customFieldPrefix marks a Jira custom-field ID. Jira encodes every custom
+// field as `customfield_<id>` in API responses; the typed go-jira struct
+// ignores them, so they land in IssueFields.Unknowns and we surface only
+// those keys to MCP callers.
+const customFieldPrefix = "customfield_"
+
+func formatReadResult(summary string, results []map[string]any, errors []string) *mcp.CallToolResult {
+	var out strings.Builder
+	out.WriteString(summary + "\n\n")
+
+	if len(errors) > 0 {
+		out.WriteString("Errors:\n")
+		for _, e := range errors {
+			out.WriteString("  - " + e + "\n")
+		}
+		out.WriteString("\n")
+	}
+
+	if len(results) > 0 {
+		data, err := json.Marshal(results)
+		if err != nil {
+			fmt.Fprintf(&out, "Failed to serialize results: %v", err)
+		} else {
+			out.Write(data)
+		}
+	}
+
+	return textResult(out.String(), false)
+}
+
+func textResult(msg string, isError bool) *mcp.CallToolResult {
+	r := &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+	}
+	if isError {
+		r.IsError = true
+	}
+	return r
+}
